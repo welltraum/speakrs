@@ -49,13 +49,15 @@ pub enum PipelineError {
         /// Backend error message
         message: String,
     },
-    /// The recording has fewer usable embeddings, or yields fewer speakers, than the
-    /// lower bound of [`crate::pipeline::SpeakerCountConstraint`]
-    #[error("cannot find {requested} speakers, the recording has only {available}")]
+    /// The recording has fewer usable embeddings than the lower bound of
+    /// [`crate::pipeline::SpeakerCountConstraint`]
+    #[error(
+        "cannot find {requested} speakers, the recording has only {available} usable embeddings"
+    )]
     SpeakerCountUnsatisfiable {
         /// Lower bound of the speaker count constraint
         requested: usize,
-        /// Usable embeddings before clustering, or speakers found after reconstruction
+        /// Embeddings usable for clustering
         available: usize,
     },
     /// The cancel flag passed to `run_with_cancel` was set

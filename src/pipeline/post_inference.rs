@@ -79,19 +79,6 @@ pub fn post_inference(
     let exclusive_segments = exclusive_diarization.to_segments();
     let exclusive_segments = merge_exclusive_segments(&exclusive_segments, config.merge_gap);
 
-    // pyannote only warns here; a result with fewer speakers than requested is an error
-    let found = segments
-        .iter()
-        .map(|segment| segment.speaker.as_str())
-        .collect::<std::collections::HashSet<_>>()
-        .len();
-    if found < requested {
-        return Err(PipelineError::SpeakerCountUnsatisfiable {
-            requested,
-            available: found,
-        });
-    }
-
     debug!(
         post_inference_ms = post_start.elapsed().as_millis(),
         "Post-inference complete"

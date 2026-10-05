@@ -32,9 +32,10 @@ pub enum ClusteringConfigError {
 /// `min_speakers` and `max_speakers`
 ///
 /// When the number VBx finds is outside the bounds, K-Means re-clusters the embeddings
-/// into the nearest bound, as pyannote `VBxClustering` does. When the recording has
-/// fewer usable embeddings or speakers than the lower bound, the pipeline returns
-/// [`crate::PipelineError::SpeakerCountUnsatisfiable`].
+/// into the nearest bound, as pyannote `VBxClustering` does. As in pyannote, the result
+/// never has more speakers than the upper bound but may have fewer than the lower one.
+/// When the recording has fewer usable embeddings than the lower bound, the pipeline
+/// returns [`crate::PipelineError::SpeakerCountUnsatisfiable`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SpeakerCountConstraint {
     /// VBx decides the number of speakers
