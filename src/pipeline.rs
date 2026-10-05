@@ -18,7 +18,7 @@ pub use config::{
     FAST_SEGMENTATION_STEP_SECONDS, FRAME_DURATION_SECONDS, FRAME_STEP_SECONDS, FbankSessionPool,
     FbankSessionPoolSize, FbankSessionPoolSizeError, OrtThreadCount, OrtThreadCountError,
     PipelineConfig, ReconstructMethod, RuntimeConfig, SEGMENTATION_STEP_SECONDS,
-    SEGMENTATION_WINDOW_SECONDS, segmentation_step_seconds,
+    SEGMENTATION_WINDOW_SECONDS, SpeakerCountConstraint, segmentation_step_seconds,
 };
 #[cfg(feature = "_metrics")]
 #[cfg_attr(docsrs, doc(cfg(feature = "_metrics")))]

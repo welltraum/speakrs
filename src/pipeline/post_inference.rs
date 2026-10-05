@@ -8,7 +8,8 @@ use crate::segment::{merge_exclusive_segments, merge_segments};
 
 use super::config::{PipelineConfig, ReconstructMethod};
 use super::types::{
-    ChunkSpeakerClusters, DiarizationResult, DiscreteDiarization, InferenceArtifacts, PipelineError,
+    ChunkSpeakerClusters, DiarizationResult, DiscreteDiarization, InferenceArtifacts,
+    PipelineError, SpeakerCountTrack,
 };
 
 /// Run clustering and reconstruction on pre-computed inference artifacts
@@ -26,11 +27,19 @@ pub fn post_inference(
             stage_timings: _,
     } = inference_artifacts;
     let speaker_count = segmentations.speaker_count(&layout);
+    let constraint = config.clustering.speaker_count();
+    let requested = constraint.lower_bound();
 
     if speaker_count
         .iter()
         .all(|speaker_count| *speaker_count == 0)
     {
+        if requested > 0 {
+            return Err(PipelineError::SpeakerCountUnsatisfiable {
+                requested,
+                available: 0,
+            });
+        }
         return Ok(DiarizationResult {
             segmentations,
             embeddings,
@@ -45,6 +54,12 @@ pub fn post_inference(
     let training_embeddings =
         embeddings.training_set(&segmentations, config.effective_clean_frame_duration());
     let hard_clusters = training_embeddings.cluster(&segmentations, &embeddings, plda, config)?;
+
+    // as pyannote: no more instantaneous speakers than `max_speakers`
+    let speaker_count = match constraint.upper_bound() {
+        Some(max) => SpeakerCountTrack(speaker_count.iter().map(|&count| count.min(max)).collect()),
+        None => speaker_count,
+    };
 
     let reconstructor = Reconstructor::new(&segmentations, &hard_clusters, &layout.start_frames)?;
     let activations = reconstructor.frame_activations(&speaker_count);
@@ -63,6 +78,19 @@ pub fn post_inference(
     let segments = merge_segments(&segments, config.merge_gap);
     let exclusive_segments = exclusive_diarization.to_segments();
     let exclusive_segments = merge_exclusive_segments(&exclusive_segments, config.merge_gap);
+
+    // pyannote only warns here; a result with fewer speakers than requested is an error
+    let found = segments
+        .iter()
+        .map(|segment| segment.speaker.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    if found < requested {
+        return Err(PipelineError::SpeakerCountUnsatisfiable {
+            requested,
+            available: found,
+        });
+    }
 
     debug!(
         post_inference_ms = post_start.elapsed().as_millis(),

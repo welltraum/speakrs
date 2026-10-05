@@ -2,12 +2,13 @@ use ndarray::{Array2, Array3, ArrayView2, s};
 use tracing::{debug, trace};
 
 use crate::clustering::ahc::cluster as cluster_ahc;
+use crate::clustering::kmeans::kmeans;
 use crate::clustering::plda::PldaTransform;
 #[cfg(feature = "_metrics")]
 use crate::clustering::sphere_vbx::cluster_sphere_vbx_pf;
 use crate::clustering::vbx::cluster_vbx;
 use crate::inference::embedding::should_use_clean_mask;
-use crate::utils::cosine_similarity;
+use crate::utils::{cosine_similarity, l2_normalize_rows};
 
 use super::config::ClusteringBackend;
 use super::config::{CleanFrameDuration, MIN_SPEAKER_ACTIVITY, PipelineConfig};
@@ -70,6 +71,14 @@ impl TrainingEmbeddings {
         plda: &PldaTransform,
         config: &PipelineConfig,
     ) -> Result<ChunkSpeakerClusters, PipelineError> {
+        let requested = config.clustering.speaker_count().lower_bound();
+        if self.0.nrows() < requested {
+            return Err(PipelineError::SpeakerCountUnsatisfiable {
+                requested,
+                available: self.0.nrows(),
+            });
+        }
+
         if self.0.nrows() < 2 {
             let mut clusters =
                 Array2::<i32>::zeros((segmentations.0.shape()[0], segmentations.0.shape()[2]));
@@ -123,7 +132,25 @@ impl TrainingEmbeddings {
             debug!(cluster = cluster_idx, norm, "centroid");
         }
 
-        let mut clusters = assign_chunk_embeddings(segmentations, embeddings, &centroids);
+        let forced = config
+            .clustering
+            .speaker_count()
+            .forced_clusters(centroids.nrows());
+        let mut clusters = match forced {
+            None => assign_chunk_embeddings(segmentations, embeddings, &centroids),
+            Some(num_clusters) => {
+                // as pyannote VBxClustering: K-Means on the normalized training embeddings,
+                // centroids from the raw ones, and no constrained assignment, which could
+                // add clusters back
+                debug!(
+                    found = centroids.nrows(),
+                    num_clusters, "K-Means forces the speaker count"
+                );
+                let labels = kmeans(&l2_normalize_rows(&self.0.view()).view(), num_clusters);
+                let centroids = cluster_means(&self.0, &labels, num_clusters);
+                nearest_centroids(embeddings, &centroids)
+            }
+        };
         mark_inactive_speakers(&segmentations.0, &mut clusters);
         debug!(
             rows = clusters.nrows(),
@@ -202,6 +229,45 @@ pub(super) fn weighted_centroids(
         }
     }
     centroids
+}
+
+/// Mean of the training embeddings in each cluster
+fn cluster_means(
+    train_embeddings: &Array2<f32>,
+    labels: &[usize],
+    num_clusters: usize,
+) -> Array2<f32> {
+    let mut centroids = Array2::<f32>::zeros((num_clusters, train_embeddings.ncols()));
+    let mut counts = vec![0usize; num_clusters];
+    for (row, &label) in train_embeddings.rows().into_iter().zip(labels) {
+        centroids.row_mut(label).scaled_add(1.0, &row);
+        counts[label] += 1;
+    }
+    for (mut centroid, count) in centroids.rows_mut().into_iter().zip(counts) {
+        centroid /= count.max(1) as f32;
+    }
+    centroids
+}
+
+/// Most similar centroid for every chunk speaker (pyannote `np.argmax(soft_clusters, axis=2)`)
+///
+/// A non-finite embedding gets cluster 0, as `argmax` over its NaN scores does.
+fn nearest_centroids(embeddings: &ChunkEmbeddings, centroids: &Array2<f32>) -> Array2<i32> {
+    let (num_chunks, num_speakers, _) = embeddings.0.dim();
+    Array2::from_shape_fn((num_chunks, num_speakers), |(chunk_idx, speaker_idx)| {
+        let embedding = embeddings.0.slice(s![chunk_idx, speaker_idx, ..]);
+        if embedding.iter().any(|value| !value.is_finite()) {
+            return 0;
+        }
+        let mut best = (0, f32::NEG_INFINITY);
+        for (cluster_idx, centroid) in centroids.rows().into_iter().enumerate() {
+            let score = cosine_similarity(&embedding, &centroid);
+            if score > best.1 {
+                best = (cluster_idx, score);
+            }
+        }
+        best.0 as i32
+    })
 }
 
 pub(super) fn assign_chunk_embeddings(

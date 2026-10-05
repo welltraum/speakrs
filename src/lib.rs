@@ -288,7 +288,7 @@ pub use pipeline::{
     OwnedDiarizationPipeline, PipelineBuilder, PipelineConfig, PipelineError, QueueConfig,
     QueueError, QueueReceiver, QueueReceiverIter, QueueSender, QueuedDiarizationJobId,
     QueuedDiarizationRequest, QueuedDiarizationResult, ReconstructError,
-    ResponsibilityInitialization, RuntimeConfig, VbxConfig, VbxConfigError,
+    ResponsibilityInitialization, RuntimeConfig, SpeakerCountConstraint, VbxConfig, VbxConfigError,
 };
 pub use segment::Segment;
 

@@ -23,6 +23,82 @@ pub enum ClusteringConfigError {
     /// Speaker-keep threshold was negative or non-finite
     #[error("speaker keep threshold must be finite and non-negative, got {0}")]
     InvalidKeepThreshold(f64),
+    /// Speaker count is zero or the range minimum exceeds its maximum
+    #[error("invalid speaker count constraint {0:?}")]
+    InvalidSpeakerCount(SpeakerCountConstraint),
+}
+
+/// How many speakers clustering must find, as pyannote's `num_speakers`,
+/// `min_speakers` and `max_speakers`
+///
+/// When the number VBx finds is outside the bounds, K-Means re-clusters the embeddings
+/// into the nearest bound, as pyannote `VBxClustering` does. When the recording has
+/// fewer usable embeddings or speakers than the lower bound, the pipeline returns
+/// [`crate::PipelineError::SpeakerCountUnsatisfiable`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SpeakerCountConstraint {
+    /// VBx decides the number of speakers
+    #[default]
+    Auto,
+    /// Exactly this many speakers
+    Exact(usize),
+    /// Between `min` and `max` speakers inclusive, an open side is `None`
+    Range {
+        /// Lower bound
+        min: Option<usize>,
+        /// Upper bound
+        max: Option<usize>,
+    },
+}
+
+impl SpeakerCountConstraint {
+    fn validate(self) -> Result<Self, ClusteringConfigError> {
+        let valid = match self {
+            Self::Auto => true,
+            Self::Exact(count) => count > 0,
+            Self::Range { min, max } => {
+                min != Some(0) && max != Some(0) && min.zip(max).is_none_or(|(lo, hi)| lo <= hi)
+            }
+        };
+        if valid {
+            Ok(self)
+        } else {
+            Err(ClusteringConfigError::InvalidSpeakerCount(self))
+        }
+    }
+
+    /// Smallest number of speakers the result must have, 0 when there is no lower bound
+    pub const fn lower_bound(self) -> usize {
+        match self {
+            Self::Exact(count)
+            | Self::Range {
+                min: Some(count), ..
+            } => count,
+            Self::Auto | Self::Range { min: None, .. } => 0,
+        }
+    }
+
+    /// Largest number of speakers the result may have
+    pub const fn upper_bound(self) -> Option<usize> {
+        match self {
+            Self::Exact(count)
+            | Self::Range {
+                max: Some(count), ..
+            } => Some(count),
+            Self::Auto | Self::Range { max: None, .. } => None,
+        }
+    }
+
+    /// Number of clusters K-Means must produce after VBx found `found` speakers,
+    /// `None` when `found` already satisfies the constraint
+    pub(crate) fn forced_clusters(self, found: usize) -> Option<usize> {
+        let target = if found < self.lower_bound().max(1) {
+            self.lower_bound().max(1)
+        } else {
+            self.upper_bound().map_or(found, |max| found.min(max))
+        };
+        (target != found).then_some(target)
+    }
 }
 
 /// Checked clustering settings owned by the clustering domain
@@ -37,6 +113,7 @@ pub struct ClusteringConfig {
     ahc: AhcConfig,
     speaker_keep_threshold: f64,
     backend: ClusteringBackend,
+    speaker_count: SpeakerCountConstraint,
 }
 
 impl Default for ClusteringConfig {
@@ -45,6 +122,7 @@ impl Default for ClusteringConfig {
             ahc: AhcConfig::default(),
             speaker_keep_threshold: 1e-7,
             backend: ClusteringBackend::GaussianVbx(VbxConfig::default()),
+            speaker_count: SpeakerCountConstraint::Auto,
         }
     }
 }
@@ -65,6 +143,7 @@ impl ClusteringConfig {
             ahc,
             speaker_keep_threshold,
             backend,
+            speaker_count: SpeakerCountConstraint::Auto,
         })
     }
 
@@ -81,6 +160,20 @@ impl ClusteringConfig {
     /// Clustering backend that will execute
     pub const fn backend(self) -> ClusteringBackend {
         self.backend
+    }
+
+    /// Constraint on the number of speakers
+    pub const fn speaker_count(self) -> SpeakerCountConstraint {
+        self.speaker_count
+    }
+
+    /// Replace the constraint on the number of speakers
+    pub fn with_speaker_count(
+        mut self,
+        speaker_count: SpeakerCountConstraint,
+    ) -> Result<Self, ClusteringConfigError> {
+        self.speaker_count = speaker_count.validate()?;
+        Ok(self)
     }
 
     /// Replace the clustering backend
@@ -100,7 +193,9 @@ impl ClusteringConfig {
         self,
         speaker_keep_threshold: f64,
     ) -> Result<Self, ClusteringConfigError> {
-        Self::new(self.ahc, speaker_keep_threshold, self.backend)
+        let mut config = Self::new(self.ahc, speaker_keep_threshold, self.backend)?;
+        config.speaker_count = self.speaker_count;
+        Ok(config)
     }
 }
 
@@ -1078,5 +1173,87 @@ mod tests {
     fn per_window_layouts_disable_native_chunk_sessions() {
         assert!(!CoreMlChunkLayout::PerWindow.uses_native_chunk_sessions());
         assert!(CoreMlChunkLayout::OneSecondPhased.uses_native_chunk_sessions());
+    }
+}
+
+#[cfg(test)]
+mod speaker_count_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_impossible_speaker_counts() {
+        for constraint in [
+            SpeakerCountConstraint::Exact(0),
+            SpeakerCountConstraint::Range {
+                min: Some(0),
+                max: None,
+            },
+            SpeakerCountConstraint::Range {
+                min: None,
+                max: Some(0),
+            },
+            SpeakerCountConstraint::Range {
+                min: Some(4),
+                max: Some(2),
+            },
+        ] {
+            assert_eq!(
+                ClusteringConfig::default()
+                    .with_speaker_count(constraint)
+                    .unwrap_err(),
+                ClusteringConfigError::InvalidSpeakerCount(constraint)
+            );
+        }
+    }
+
+    #[test]
+    fn speaker_count_defaults_to_auto_and_survives_other_setters() {
+        let exact = SpeakerCountConstraint::Exact(3);
+        let config = ClusteringConfig::default()
+            .with_speaker_count(exact)
+            .unwrap()
+            .with_speaker_keep_threshold(0.5)
+            .unwrap();
+        assert_eq!(config.speaker_count(), exact);
+        assert_eq!(
+            ClusteringConfig::default().speaker_count(),
+            SpeakerCountConstraint::Auto
+        );
+    }
+
+    #[test]
+    fn forces_clusters_only_outside_the_bounds() {
+        let range = SpeakerCountConstraint::Range {
+            min: Some(2),
+            max: Some(4),
+        };
+        let at_least = SpeakerCountConstraint::Range {
+            min: Some(3),
+            max: None,
+        };
+        let at_most = SpeakerCountConstraint::Range {
+            min: None,
+            max: Some(2),
+        };
+        let cases = [
+            (SpeakerCountConstraint::Auto, 5, None),
+            (SpeakerCountConstraint::Exact(3), 3, None),
+            (SpeakerCountConstraint::Exact(3), 1, Some(3)),
+            (SpeakerCountConstraint::Exact(3), 6, Some(3)),
+            (range, 1, Some(2)),
+            (range, 3, None),
+            (range, 5, Some(4)),
+            (at_least, 2, Some(3)),
+            (at_least, 9, None),
+            (at_most, 1, None),
+            (at_most, 3, Some(2)),
+        ];
+        for (constraint, found, expected) in cases {
+            assert_eq!(
+                constraint.forced_clusters(found),
+                expected,
+                "{constraint:?} with {found} found"
+            );
+        }
     }
 }

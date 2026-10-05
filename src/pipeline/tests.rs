@@ -862,3 +862,105 @@ fn batch_chunk_embedding_keeps_unaligned_padded_tails() {
             .all(|result| result.segmentations.nchunks() == 4)
     );
 }
+
+/// Clusters the pyannote fixture of `test.wav` under a speaker count constraint
+fn cluster_python_fixture(
+    constraint: SpeakerCountConstraint,
+) -> Result<Array2<i32>, PipelineError> {
+    let segmentations = DecodedSegmentations(load_fixture_array3("pipeline_segmentation_data.npy"));
+    let embeddings = ChunkEmbeddings(load_fixture_array3("pipeline_embeddings_data.npy"));
+    let plda = PldaTransform::from_dir(&models_dir()).unwrap();
+    let config = PipelineConfig {
+        clustering: ClusteringConfig::default()
+            .with_speaker_count(constraint)
+            .unwrap(),
+        ..PipelineConfig::default()
+    };
+    embeddings
+        .training_set(&segmentations, CleanFrameDuration::default())
+        .cluster(&segmentations, &embeddings, &plda, &config)
+        .map(|clusters| clusters.0)
+}
+
+fn distinct_clusters(hard_clusters: &Array2<i32>) -> usize {
+    hard_clusters
+        .iter()
+        .filter(|&&cluster| cluster >= 0)
+        .collect::<std::collections::BTreeSet<_>>()
+        .len()
+}
+
+#[test]
+fn speaker_count_within_bounds_keeps_vbx_result() {
+    let auto = cluster_python_fixture(SpeakerCountConstraint::Auto).unwrap();
+    let found = distinct_clusters(&auto);
+    let expected: Array2<i8> = load_fixture_array2("pipeline_hard_clusters.npy");
+    assert_eq!(auto.mapv(|cluster| cluster as i8), expected);
+
+    for constraint in [
+        SpeakerCountConstraint::Exact(found),
+        SpeakerCountConstraint::Range {
+            min: Some(found),
+            max: None,
+        },
+        SpeakerCountConstraint::Range {
+            min: Some(1),
+            max: Some(found + 1),
+        },
+    ] {
+        assert_eq!(
+            cluster_python_fixture(constraint).unwrap(),
+            auto,
+            "{constraint:?}"
+        );
+    }
+}
+
+/// Fixtures from `scripts/generate_speaker_count_fixtures.py` (pyannote `VBxClustering`)
+#[test]
+fn speaker_count_outside_bounds_matches_pyannote_kmeans() {
+    let cases = [
+        ("exact_3", SpeakerCountConstraint::Exact(3)),
+        ("exact_1", SpeakerCountConstraint::Exact(1)),
+        (
+            "min_4",
+            SpeakerCountConstraint::Range {
+                min: Some(4),
+                max: None,
+            },
+        ),
+        (
+            "max_1",
+            SpeakerCountConstraint::Range {
+                min: None,
+                max: Some(1),
+            },
+        ),
+    ];
+    for (name, constraint) in cases {
+        let expected: Array2<i8> =
+            load_fixture_array2(&format!("pipeline_hard_clusters_{name}.npy"));
+        let clusters = cluster_python_fixture(constraint).unwrap();
+        assert_eq!(clusters.mapv(|cluster| cluster as i8), expected, "{name}");
+    }
+}
+
+#[test]
+fn speaker_count_above_usable_embeddings_is_unsatisfiable() {
+    let segmentations = DecodedSegmentations(load_fixture_array3("pipeline_segmentation_data.npy"));
+    let embeddings = ChunkEmbeddings(load_fixture_array3("pipeline_embeddings_data.npy"));
+    let usable = embeddings
+        .training_set(&segmentations, CleanFrameDuration::default())
+        .0
+        .nrows();
+
+    let error = cluster_python_fixture(SpeakerCountConstraint::Exact(usable + 1)).unwrap_err();
+    assert!(
+        matches!(
+            error,
+            PipelineError::SpeakerCountUnsatisfiable { requested, available }
+                if requested == usable + 1 && available == usable
+        ),
+        "{error}"
+    );
+}
