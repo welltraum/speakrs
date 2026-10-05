@@ -70,6 +70,7 @@ mod test_support;
 mod tests;
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ndarray::Array2;
 use tracing::{debug, trace};
@@ -107,6 +108,23 @@ macro_rules! pipeline_run_methods {
             config: &PipelineConfig,
         ) -> Result<DiarizationResult, PipelineError> {
             self.runner().run(audio, file_id, config)
+        }
+
+        /// Diarize audio like [`Self::run_with_config`], stopping with
+        /// [`PipelineError::Cancelled`] soon after `cancel` is set
+        ///
+        /// The flag is checked between stages and, for recordings long enough for chunk
+        /// embedding, between segmentation windows and between embedded chunks.
+        pub fn run_with_cancel(
+            &mut self,
+            audio: &[f32],
+            file_id: &str,
+            config: &PipelineConfig,
+            cancel: &AtomicBool,
+        ) -> Result<DiarizationResult, PipelineError> {
+            let mut runner = self.runner();
+            runner.cancel = Some(cancel);
+            runner.run(audio, file_id, config)
         }
 
         /// Run only inference (segmentation + embedding), returning intermediate artifacts
@@ -309,6 +327,7 @@ impl OwnedDiarizationPipeline {
             powerset: &self.powerset,
             #[cfg(feature = "coreml")]
             coreml_chunk_execution_policy: self.coreml_chunk_execution_policy,
+            cancel: None,
         }
     }
 }
@@ -322,6 +341,7 @@ impl<'a> DiarizationPipeline<'a> {
             powerset: &self.powerset,
             #[cfg(feature = "coreml")]
             coreml_chunk_execution_policy: self.coreml_chunk_execution_policy,
+            cancel: None,
         }
     }
 }
@@ -333,17 +353,36 @@ struct PipelineRunner<'a> {
     powerset: &'a PowersetMapping,
     #[cfg(feature = "coreml")]
     coreml_chunk_execution_policy: config::CoreMlChunkExecutionPolicy,
+    cancel: Option<&'a AtomicBool>,
 }
 
 impl<'a> PipelineRunner<'a> {
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+    }
+
     fn run(
         &mut self,
         audio: &[f32],
         file_id: &str,
         config: &PipelineConfig,
     ) -> Result<DiarizationResult, PipelineError> {
+        if self.cancelled() {
+            return Err(PipelineError::Cancelled);
+        }
         let run_start = std::time::Instant::now();
-        let inference_artifacts = self.run_inference(audio)?;
+        // a cancelled run may fail anywhere in inference, e.g. on a closed channel
+        let inference_artifacts = self.run_inference(audio).map_err(|error| {
+            if self.cancelled() {
+                PipelineError::Cancelled
+            } else {
+                error
+            }
+        })?;
+        if self.cancelled() {
+            return Err(PipelineError::Cancelled);
+        }
         let inference_ms = run_start.elapsed().as_millis();
         let post_start = std::time::Instant::now();
         let result = self.run_post_inference(inference_artifacts, config)?;
@@ -435,6 +474,7 @@ impl<'a> PipelineRunner<'a> {
                     self.powerset,
                     audio,
                     self.coreml_chunk_execution_policy,
+                    self.cancel,
                 )? {
                     return Ok(result);
                 }

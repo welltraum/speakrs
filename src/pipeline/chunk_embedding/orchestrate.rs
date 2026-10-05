@@ -1,3 +1,5 @@
+use std::sync::atomic::Ordering;
+
 use crossbeam_channel::Receiver;
 use tracing::{debug, trace};
 
@@ -137,6 +139,14 @@ pub(super) fn run_pipelined<'scope>(
     let mut total_predict_us = 0u64;
     let mut total_chunks = 0u32;
     while let Ok(embedded) = emb_rx.recv() {
+        // dropping the receivers below winds the GPU and preparation workers down
+        if params
+            .cancel
+            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        {
+            collect_error = Some(PipelineError::Cancelled);
+            break;
+        }
         total_predict_us += embedded.predict_us;
         total_chunks += 1;
         if let Err(error) = collector.add(embedded) {

@@ -58,6 +58,9 @@ pub enum PipelineError {
         /// Usable embeddings before clustering, or speakers found after reconstruction
         available: usize,
     },
+    /// The cancel flag passed to `run_with_cancel` was set
+    #[error("diarization was cancelled")]
+    Cancelled,
     /// Catch-all for other pipeline errors
     #[error("{0}")]
     Other(String),

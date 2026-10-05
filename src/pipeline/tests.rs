@@ -964,3 +964,15 @@ fn speaker_count_above_usable_embeddings_is_unsatisfiable() {
         "{error}"
     );
 }
+
+#[test]
+fn run_with_cancel_stops_when_flag_is_set() {
+    let harness = PipelineTestHarness::load();
+    let Some(mut pipeline) = harness.cpu_pipeline() else {
+        return;
+    };
+    let cancel = std::sync::atomic::AtomicBool::new(true);
+    let config = pipeline.pipeline_config();
+    let result = pipeline.run_with_cancel(harness.audio(), "file1", &config, &cancel);
+    assert!(matches!(result, Err(PipelineError::Cancelled)));
+}

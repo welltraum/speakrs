@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use ndarray::{Array2, Array3};
 use tracing::{debug, trace};
 
@@ -38,7 +40,7 @@ use prep::{ChunkJob, ChunkPrep, PrepScratch, PrepWorker};
 /// frames per segment relative to the speaker masks
 pub(super) const FBANK_SEGMENT_SAMPLES: usize = FBANK_FRAMES * FBANK_HOP_SAMPLES;
 
-struct ChunkParams {
+struct ChunkParams<'a> {
     step_samples: usize,
     window_samples: usize,
     num_speakers: usize,
@@ -46,6 +48,7 @@ struct ChunkParams {
     segmentation_workers: usize,
     fbank_preparation_workers: usize,
     fbank_normalization_scope: ChunkFbankNormalizationScope,
+    cancel: Option<&'a AtomicBool>,
 }
 
 struct EmbeddingSummary {
@@ -81,6 +84,7 @@ pub(super) fn try_chunk_embedding(
     powerset: &PowersetMapping,
     audio: &[f32],
     execution_policy: CoreMlChunkExecutionPolicy,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Option<InferenceArtifacts>, PipelineError> {
     let Some(plan) = ChunkExecutionPlan::resolve(seg_model, emb_model, audio)? else {
         return Ok(None);
@@ -99,6 +103,7 @@ pub(super) fn try_chunk_embedding(
         segmentation_workers: execution_policy.segmentation_workers,
         fbank_preparation_workers: execution_policy.fbank_preparation_workers,
         fbank_normalization_scope: execution_policy.fbank_normalization_scope,
+        cancel,
     };
 
     let (seg_tx, seg_rx) = crossbeam_channel::bounded::<Array2<f32>>(100);
@@ -122,6 +127,10 @@ pub(super) fn try_chunk_embedding(
             let mut global_start = 0usize;
 
             for raw_window in &seg_rx {
+                // returning drops both channels: segmentation and embedding wind down
+                if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+                    return Err(PipelineError::Cancelled);
+                }
                 group.push(powerset.hard_decode(&raw_window)?);
 
                 if group.len() == chunk_win_capacity {
